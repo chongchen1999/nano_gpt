@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import tiktoken
-
+import time
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
@@ -12,6 +12,7 @@ class CausalSelfAttention(nn.Module):
 
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -47,6 +48,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate="tanh")
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -98,6 +100,20 @@ class GPT(nn.Module):
             }
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, "NANOGPT_SCALE_INIT"):
+                std += (2.0 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         # idx is the shape of (batch_size, sequence_length)
@@ -209,7 +225,7 @@ class DataLoaderLite:
 
     def next_batch(self):
         B, T = self.B, self.T
-        buf = self.tokens[self.current_position : self.current_position + B * T]
+        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
 
         x = buf[:-1].view(B, T)
         y = buf[1:].view(B, T)
@@ -229,16 +245,11 @@ if __name__ == "__main__":
     max_length = 30
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    encoder = tiktoken.get_encoding("gpt2")
+    torch.manual_seed(1337)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(1337)
 
-    with open("input.txt", "r") as f:
-        text = f.read()
-    text = text[:1000]
-    tokens = encoder.encode(text)
-    B, T = 4, 32
-    buf = torch.tensor(tokens[: B * T + 1])
-    x = buf[:-1].view(B, T).to(device)
-    y = buf[1:].view(B, T).to(device)
+    train_loader = DataLoaderLite(B=16, T=256)
 
     model = GPT(GPTConfig())
     model.to(device)
@@ -246,12 +257,18 @@ if __name__ == "__main__":
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     for i in range(50):
-        logits, loss = model(x, y)
+        t0 = time.time()
+        x, y = train_loader.next_batch()
+        x, y = x.to(device),  y.to(device)
         optimizer.zero_grad(set_to_none=True)
+
+        logits, loss = model(x, y)
         loss.backward()
         optimizer.step()
-        if i % 10 == 0:
-            print(f"step {i}, loss: {loss.item():.4f}")
+        torch.cuda.synchronize()
+        t1 = time.time()
+        dt = (t1 - t0) * 1000.0
+        print(f"step {i}, loss: {loss.item():.4f}, dt: {dt:.2f}ms")
 
     import sys
 
