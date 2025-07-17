@@ -5,6 +5,7 @@ from torch.nn import functional as F
 import tiktoken
 import time
 
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -32,11 +33,12 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        att = (q @ k.transpose(-2, -1)) * (1.0 / (k.size(-1) ** 0.5))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / (k.size(-1) ** 0.5))
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
-        y = att @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         return y
@@ -249,51 +251,58 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         torch.cuda.manual_seed(1337)
 
-    train_loader = DataLoaderLite(B=16, T=256)
+    train_loader = DataLoaderLite(B=4, T=1024)
+    torch.set_float32_matmul_precision("medium")
 
-    model = GPT(GPTConfig())
+    model = GPT(GPTConfig(vocab_size=50304))
     model.to(device)
+    model = torch.compile(model)
     # logits, loss = model(x, y)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
     for i in range(50):
         t0 = time.time()
         x, y = train_loader.next_batch()
-        x, y = x.to(device),  y.to(device)
+        x, y = x.to(device), y.to(device)
         optimizer.zero_grad(set_to_none=True)
 
-        logits, loss = model(x, y)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+
         loss.backward()
         optimizer.step()
         torch.cuda.synchronize()
         t1 = time.time()
         dt = (t1 - t0) * 1000.0
-        print(f"step {i}, loss: {loss.item():.4f}, dt: {dt:.2f}ms")
+        tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+        print(
+            f"step {i}, loss: {loss.item():.4f}, dt: {dt:.2f}ms, {tokens_per_sec:.2f} tokens/sec"
+        )
 
     import sys
 
     sys.exit(0)
 
-    tokens = encoder.encode("Hello, I'm a language model,")
-    tokens = torch.tensor(tokens, dtype=torch.long)
-    tokens = tokens.unsqueeze(0).repeat(num_return_seq, 1)
-    x = tokens.to(device)
+    # tokens = encoder.encode("Hello, I'm a language model,")
+    # tokens = torch.tensor(tokens, dtype=torch.long)
+    # tokens = tokens.unsqueeze(0).repeat(num_return_seq, 1)
+    # x = tokens.to(device)
 
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-    while x.size(1) < max_length:
-        with torch.no_grad():
-            logits = model(x)
-            logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
+    # torch.manual_seed(42)
+    # torch.cuda.manual_seed(42)
+    # while x.size(1) < max_length:
+    #     with torch.no_grad():
+    #         logits = model(x)
+    #         logits = logits[:, -1, :]
+    #         probs = F.softmax(logits, dim=-1)
 
-            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+    #         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
 
-            ix = torch.multinomial(topk_probs, 1)
-            xcol = torch.gather(topk_indices, -1, ix)
-            x = torch.cat((x, xcol), dim=1)
+    #         ix = torch.multinomial(topk_probs, 1)
+    #         xcol = torch.gather(topk_indices, -1, ix)
+    #         x = torch.cat((x, xcol), dim=1)
 
-    for i in range(num_return_seq):
-        tokens = x[i, :max_length].tolist()
-        decoded = encoder.decode(tokens)
-        print(">", decoded)
+    # for i in range(num_return_seq):
+    #     tokens = x[i, :max_length].tolist()
+    #     decoded = encoder.decode(tokens)
+    #     print(">", decoded)
